@@ -4,7 +4,7 @@
 
 [![GenLayer](https://img.shields.io/badge/Built%20on-GenLayer-6366f1?style=for-the-badge&logo=genlayer)](https://genlayer.com)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-28%20passed-16a34a?style=for-the-badge)](https://github.com/)
+[![Tests](https://img.shields.io/badge/tests-30%20passed-16a34a?style=for-the-badge)](https://github.com/)
 
 ---
 
@@ -23,9 +23,9 @@
 
 ## How it works
 
-1. **Register a project** — `register_project(name, methodology, beneficiary, annual_cap, unit)`. The cap and the quantity unit are declared once; the beneficiary is the party that receives settlement payments.
+1. **Register a project** — `register_project(name, methodology, beneficiary, annual_cap, unit, source_key)`. The cap and the quantity unit are declared once; the beneficiary is the party that receives settlement payments; the `source_key` is a unique string that must appear in the project's own evidence document (e.g. a World Bank indicator code), binding evidence to the project.
 2. **Submit evidence** — the beneficiary submits a monitoring report URL plus an EIP-191 signature bound to `{project_id}:{url}:{description}`.
-3. **Verify** — anyone calls `verify_evidence`. Validators fetch the report and the LLM extracts the reported quantity; consensus compares the independently extracted numbers.
+3. **Verify** — anyone calls `verify_evidence`. Validators fetch the report, check that the document contains the project's `source_key` (deterministic, identical on every validator), and the LLM extracts the reported quantity; consensus binds the exact quantity that will be minted.
 4. **Issue** — the verified quantity is issued as a credit lot with a unique serial (`VCS-{project}-{n}`), clamped to the project's remaining annual cap. A lot is a *lot*, not a token: it carries the verified tonnage.
 5. **Use the credit** —
    - `transfer_credit(serial, to)` — moves the lot to a new owner;
@@ -54,7 +54,8 @@ register_project ──► submit_evidence ──► verify_evidence ──► l
 Carbon registries are *ledgers*, and this contract is built like one rather than like a token contract:
 
 - **Credits are serials with one owner and one terminal state.** Double-spending is not prevented by accounting conventions — it is prevented by explicit state transitions (`issued → settling → settled`, `issued → retired`, `issued → issued` with a new owner). A retired or settled serial can never be spent again.
-- **The model extracts a quantity, it does not judge.** It reads the amount the report states; the number of credits issued is derived on-chain from that number and clamped to the registered cap. No score decides value, and no model computes a price.
+- **The model extracts a quantity, it does not judge.** It reads the amount the report states; the number of credits issued is derived on-chain from that number and clamped to the registered cap. No score decides value, and no model computes a price — and what consensus accepts is the literal minted amount, not a range.
+- **The evidence must be about this project.** Each project registers a `source_key` (e.g. its registry serial or a statistical indicator code); verification fails unless the fetched document contains that key, so a report describing a different project cannot mint credits here. The check is a deterministic substring test, identical on every validator.
 - **The unit is declared on-chain.** Each project records the unit its reports use (`t CO2e`, `Mt CO2e`), so the ledger is self-describing and the cap and the quantities are always in the same unit.
 - **Evidence sources are submitter-independent.** A project cannot present a page it controls; only registries and public statistical agencies are fetchable, and the source is resolved over DNS-over-HTTPS before and after every request.
 - **Settlement is two-step on purpose.** The buyer's payment is held by the registry and only reaches the beneficiary on an explicit release; if that never happens, the seller can cancel and get the money back. A credit can therefore never be paid twice *and* a buyer can never be stuck.
@@ -66,8 +67,9 @@ Carbon registries are *ledgers*, and this contract is built like one rather than
 
 `verify_evidence` uses `run_nondet_unsafe` with the Equivalence Principle:
 
-- **Leader**: fetches the evidence through the trusted fetch path and asks the LLM for the reported amount in integer thousandths (the calldata layer cannot encode floats).
-- **Validator**: independently fetches and extracts, then compares: equal, or within ±5 % (basis points) with a floor of one unit.
+- **Leader**: fetches the evidence through the trusted fetch path, checks the document contains the project's `source_key`, and asks the LLM for the reported amount in integer thousandths (the calldata layer cannot encode floats). The returned value is the **exact clamped issuance** — canonicalized to a 0.1-unit grid and clamped to the remaining annual cap — i.e. the literal number of milli-units that will be minted.
+- **Validator**: independently fetches, runs the same deterministic `source_key` substring check on the body (case-insensitive `in` — identical arithmetic on every validator, never an LLM boolean), extracts its own quantity, and accepts **iff** its own clamped issuance equals the leader's exactly. No ±% band exists: the accepted value *is* the minted value.
+- **Attribution is deterministic**: the `source_key` check ensures the fetched document is about the registered project (a report for a different project/indicator fails the check and cannot mint credits for this one). The LLM's role stays purely numeric extraction.
 - **Error classification**: `[EXPECTED]` and `[EXTERNAL]` (source unreachable, 4xx, blocked host) must match exactly; `[TRANSIENT]` (5xx/network) agrees if both fail; `[LLM]` always disagrees, forcing rotation.
 - **Permanent vs transient**: a permanent evidence failure is *recorded* (`status = evidence_failed`, `failure_reason`) instead of reverting, so the project can resubmit; a transient failure reverts and changes nothing.
 
@@ -87,6 +89,7 @@ Carbon registries are *ledgers*, and this contract is built like one rather than
 ## Security & audit
 
 - **Evidence authenticity**: `submit_evidence` requires an EIP-191 signature over `{project_id}:{url}:{description}` whose recovered signer equals the transaction sender, and the sender must be the project's beneficiary.
+- **Evidence attribution**: the fetched document must contain the project's registered `source_key` (case-insensitive substring); a document about a different project cannot mint credits for this one, and the check is deterministic — not an LLM judgement.
 - **Source trust**: only allowlisted, submitter-independent domains may be fetched; every hop is resolved over DNS-over-HTTPS before the request (private/loopback/link-local/reserved/CGNAT addresses rejected) and re-resolved afterwards (a rebinding inside the fetch window is detected and the content discarded).
 - **Issuance bound**: the issued quantity is clamped to the project's remaining annual cap, so repeated verifications cannot exceed it; a project at its cap refuses further evidence.
 - **Sole ownership**: transfer and settlement require the current owner as the sender; the zero address is rejected as a counterparty.
@@ -106,7 +109,7 @@ pytest tests/ -v
 genvm-lint check contracts/carbon_registry.py
 ```
 
-28 GenVM direct-mode tests pass. Lint passes. E2E passes on studionet (see below). Deployed to studionet.
+30 GenVM direct-mode tests pass. Lint passes. E2E passes on studionet (see below). Deployed to studionet.
 
 ---
 
@@ -114,20 +117,22 @@ genvm-lint check contracts/carbon_registry.py
 
 [![Explore](https://img.shields.io/badge/Explore-Studionet-6366f1?style=for-the-badge)](https://genlayer-explorer.vercel.app)
 
-**Address:** `0x1FdE631E82840f2D92e6Be0Bf9867f3a2170b7Bb`
+**Address:** `0x4f57A7F3136222B6d433E6756316708Cd41bC8c2`
 **Chain:** Studionet (Genlayer Studio Network)
 **Deployer:** `0x689759bb926E032EAfb1eE986eD7A98C1496ec1c`
-**Tx:** `0x3e2664d408e995e8234bffa79d8c30731d02637739981419ce1ef1593c1c6ffe`
+**Tx:** `0x02c1db9353382db893cd5f1f77a629649cc131b4bf63ceb2691ce366dd92d201`
+**Source SHA-256:** `DCCAFEE29118CD252C68D960981F1938FE2B670F3D9D829FCF8AA368F93DE059`
 **Status:** Deployed and tested on studionet.
 
-Live E2E (script `scripts/e2e-test.cjs`), every step MAJORITY_AGREE:
-- **register_project** → `P0` (cap 5000 `Mt CO2e`, beneficiary `0xe57A…6614`).
-- **submit_evidence** — beneficiary-signed, source `api.worldbank.org` indicator `EN.GHG.CO2.MT.CE.AR5`.
-- **verify_evidence** — validators fetched the live World Bank response and the LLM extracted the reported amount: **642,088 milli = 642.088 Mt CO2e** → lot `VCS-P0-0` issued to the beneficiary.
+Live E2E on studionet (scripts `e2e-test.cjs` + `resume-e2e.cjs`), every consensus step MAJORITY_AGREE:
+- **register_project** → `P0` (cap 5000 `Mt CO2e`, source key `EN.GHG.CO2.MT.CE.AR5`, beneficiary `0xe57A…6614`).
+- **submit_evidence** — beneficiary-signed, source `api.worldbank.org` World Bank indicator `EN.GHG.CO2.MT.CE.AR5` (the source key is present in the live document body — attribution checked deterministically).
+- **verify_evidence** — MAJORITY_AGREE **on attempt 1**: live value 642.0878 → canonical **642100 milli = 642.1 Mt CO2e** minted as lot `VCS-P0-0`.
 - **transfer_credit** → owner became the buyer.
-- **settle_credit** (0.01 GEN) → state `settling`, value escrowed → **release_settlement** → state `settled`, and the beneficiary's balance rose 0.06 → 0.07 GEN.
-- **Second project → issue → retire** → lot retired against a compliance claim; retired is final.
-- Final `registry_totals`: `credits_issued 2`, `total_issued_milli 1284176`, `total_retired_milli 642088`, `total_settled_milli 642088`, `total_settlement_value 1e16` — one lot settled, one retired, none double-spent.
+- **settle_credit** (0.01 GEN) → state `settling`, value escrowed → **release_settlement** → state `settled`, beneficiary balance rose by exactly `10000000000000000` wei.
+- **Second project** `P1` → signed evidence → **verify MAJORITY_AGREE on attempt 1** → lot `VCS-P1-1` (again exactly 642100 milli — two independent consensus runs binding the identical quantity) → settled and released (beneficiary +0.01 GEN).
+- **Periodic reporting**: `P1`'s second monitoring period verified under consensus (attempt 1, 642100 milli) → second lot `VCS-P1-2` issued under the same annual cap → **retire_credit** → state `retired` (final).
+- Final `registry_totals`: `credits_issued 3`, `projects 2`, `total_issued_milli 1926300`, `total_retired_milli 642100`, `total_settled_milli 1284200`, `total_settlement_value 2e16` — issued = settled + retired + held (0), no lot double-spent, no value stranded.
 
 ---
 
