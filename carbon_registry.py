@@ -11,9 +11,17 @@
 
 Why this design (and why it survives review):
   1. Issuance is gated by consensus over retrieved evidence, and the model
-     extracts a *quantity* rather than passing a score: the number of credits
-     issued is derived on-chain from the extracted tonnage, capped by the
-     project's registered annual cap. No discretionary judgement moves value.
+     extracts a *quantity* rather than passing a score. Two properties make
+     this safe: (a) attribution is verified deterministically, not by LLM
+     opinion — the fetched document must literally contain the project's
+     registered source key (an identical substring check on every validator),
+     so a stray figure from an unrelated page can never mint credits and the
+     check itself never causes disagreement; (b) consensus binds a *canonical*
+     quantity — the extracted reading is rounded to the 0.1-unit grid (so
+     sub-unit extraction noise cancels) and clamped to the remaining cap, and
+     a validator accepts only when the amount it independently derives equals
+     the leader's. An agreed verification always mints one identical amount,
+     never two within some tolerance. No discretionary judgement moves value.
   2. Credits are serial numbers in a ledger, not a fungible balance: every
      credit has one owner and one terminal state (transferred, settled or
      retired), enforced by explicit state transitions — the classic
@@ -45,6 +53,7 @@ MAX_NAME_CHARS = 80
 MAX_METHODOLOGY_CHARS = 300
 MAX_EVIDENCE_CHARS = 500
 MAX_UNIT_CHARS = 24
+MAX_SOURCE_KEY_CHARS = 64
 MAX_URL_CHARS = 2048
 MAX_EVIDENCE_BODY_CHARS = 4000
 MAX_PROJECTS_PER_BENEFICIARY = 20
@@ -56,10 +65,6 @@ SETTLEMENT_WINDOW_SECONDS = 3600
 # Quantities are stored as integer milli-tonnes (t CO2e * 1000) so that
 # fractional tonnages survive without floating point in storage.
 QTY_SCALE = 1000
-
-# Independent extractions of the same quantity differ slightly; validators
-# agree when they are within this tolerance (basis points) or one unit.
-QTY_TOLERANCE_BPS = 500
 
 MIN_PROJECT_CAP_TONNES = 1
 MAX_PROJECT_CAP_TONNES = 1000000
@@ -490,21 +495,26 @@ def _fetch_evidence(url: str) -> str:
 
 
 def _extract_quantity(body: str) -> int:
-    """Extract the verified tonnage (milli-tonnes) from an evidence report.
+    """Extract the verified emission-reduction quantity from an evidence report.
 
-    The only language-model step in this contract: it reads a single number
-    out of a retrieved report. The number of credits issued is derived from
-    it on-chain and capped by the project's registered cap.
+    The only language-model step in this contract. Project attribution is NOT
+    left to the model — the caller has already proven, by a deterministic
+    substring check, that this document references the registered project's
+    source key. The model's job is therefore purely numeric: read the emission
+    reduction the document reports. The number of credits issued is derived
+    from it on-chain, canonicalized, capped by the project's registered cap,
+    and consensus binds that exact issued amount.
     """
     prompt = (
-        "Read the quantity that the document reports as the amount.\n\n"
+        "Read the verified emission-reduction amount reported in the document "
+        "below.\n\n"
         "Document:\n" + body + "\n\n"
-        "Return ONLY JSON of the form {\"quantity_milli\": <integer>} where quantity_milli "
-        "is the numeric field that carries the reported amount (usually the field named "
-        "\"value\"), expressed in thousandths of the unit the document uses (for example "
-        "642.0878 -> 642088). Ignore dates, years, identifiers, page numbers, counts, "
-        "flags and units — only the reported amount counts. If the document reports no "
-        "amount, return {\"quantity_milli\": null}."
+        "Return ONLY JSON of the form {\"quantity_milli\": <integer>} where "
+        "quantity_milli is the verified emission-reduction amount in thousandths "
+        "of the unit the document uses (for example 642.0878 -> 642088). Ignore "
+        "dates, years, identifiers, page numbers, counts, flags and units — only "
+        "the reported emission-reduction amount counts. If the document reports no "
+        "such amount, return {\"quantity_milli\": null}."
     )
     try:
         out = gl.nondet.exec_prompt(prompt, response_format="json")
@@ -524,15 +534,45 @@ def _extract_quantity(body: str) -> int:
     return raw
 
 
-def _quantities_agree(mine: int, theirs: int) -> bool:
-    if mine <= 0 or theirs <= 0:
-        return False
-    hi = max(mine, theirs)
-    lo = min(mine, theirs)
-    if hi == lo:
-        return True
-    tolerance = max(1, (hi * QTY_TOLERANCE_BPS) // 10000)
-    return (hi - lo) <= tolerance
+def _ensure_project_evidence(body: str, source_key: str) -> None:
+    """Deterministically prove the document references this project.
+
+    The project registers a source key (its registry / indicator identifier).
+    The fetched document must literally contain it, case-insensitively. This is
+    a pure string check — identical for every validator, so it never causes
+    disagreement — and it means the quantity about to be extracted comes from a
+    document that is provably tied to the registered project, not a stray page.
+    """
+    if not source_key or source_key.lower() not in body.lower():
+        raise gl.vm.UserError(
+            ERROR_EXTERNAL + "evidence does not reference the project source key"
+        )
+
+
+def _canonical_quantity(quantity_milli: int) -> int:
+    """Round an extracted quantity to the canonical 0.1-unit grid.
+
+    Independent LLM extractions of the same source differ by a few thousandths
+    (642.0878 -> 642088 vs 642087). Rounding to the nearest tenth of a unit
+    makes those sub-unit differences cancel, so validators converge on ONE
+    canonical quantity that then deterministically binds the exact amount
+    minted. A disagreement that survives this rounding is a real disagreement
+    about the reported amount, not extraction noise.
+    """
+    if quantity_milli <= 0:
+        return 0
+    grid = QTY_SCALE // 10  # 0.1 unit
+    half = grid // 2
+    return ((quantity_milli + half) // grid) * grid
+
+
+def _clamped_issuance(quantity: int, remaining: int) -> int:
+    """The exact amount that will be minted for a verified quantity."""
+    if remaining <= 0:
+        return 0
+    if quantity > remaining:
+        return remaining
+    return quantity
 
 
 @allow_storage
@@ -542,6 +582,7 @@ class Project:
     name: str
     methodology: str
     unit: str
+    source_key: str
     beneficiary: Address
     annual_cap_milli: u256
     issued_milli: u256
@@ -592,12 +633,15 @@ class CarbonRegistry(gl.Contract):
         beneficiary: Address,
         annual_cap_tonnes: int,
         unit: str,
+        source_key: str,
     ) -> str:
         """Register a project with the beneficiary that receives settlements.
 
         The unit is declared by the project and is the unit its evidence
         reports (production registries use "t CO2e"); the annual cap is
-        expressed in the same unit.
+        expressed in the same unit. The source key is the identifier that must
+        appear in every evidence document (its registry / indicator ID), which
+        is how project attribution is verified deterministically.
         """
         if not name or len(name) > MAX_NAME_CHARS:
             raise gl.vm.UserError("name must be 1-" + str(MAX_NAME_CHARS) + " characters")
@@ -607,6 +651,10 @@ class CarbonRegistry(gl.Contract):
             )
         if not unit or len(unit) > MAX_UNIT_CHARS:
             raise gl.vm.UserError("unit must be 1-" + str(MAX_UNIT_CHARS) + " characters")
+        if not source_key or len(source_key) > MAX_SOURCE_KEY_CHARS:
+            raise gl.vm.UserError(
+                "source_key must be 1-" + str(MAX_SOURCE_KEY_CHARS) + " characters"
+            )
         cap = int(annual_cap_tonnes)
         if cap < MIN_PROJECT_CAP_TONNES or cap > MAX_PROJECT_CAP_TONNES:
             raise gl.vm.UserError("annual cap out of range")
@@ -618,6 +666,7 @@ class CarbonRegistry(gl.Contract):
             name=name,
             methodology=methodology,
             unit=unit,
+            source_key=source_key,
             beneficiary=ben,
             annual_cap_milli=u256(cap * QTY_SCALE),
             issued_milli=0,
@@ -676,8 +725,21 @@ class CarbonRegistry(gl.Contract):
         if project.status != "evidence_submitted":
             raise gl.vm.UserError("no evidence submitted")
         url = project.evidence_url
+        cap = int(project.annual_cap_milli)
+        issued = int(project.issued_milli)
+        remaining = cap - issued
+        if remaining <= 0:
+            project.status = "cap_reached"
+            self.projects[pid] = project
+            return
         try:
-            quantity = _run_quantity_consensus(url)
+            # consensus returns the exact amount that will be minted (already
+            # canonicalized and clamped to the remaining cap), so validators and
+            # leader agree on the identical issuance; attribution is proven by
+            # the deterministic source_key check inside consensus
+            quantity = _run_quantity_consensus(
+                str(project.source_key), url, remaining
+            )
         except gl.vm.UserError as e:
             message = e.message if hasattr(e, "message") else str(e)
             if not (message.startswith(ERROR_EXTERNAL) or message.startswith(ERROR_EXPECTED)):
@@ -690,15 +752,10 @@ class CarbonRegistry(gl.Contract):
             self.projects[pid] = project
             return
 
-        cap = int(project.annual_cap_milli)
-        issued = int(project.issued_milli)
-        remaining = cap - issued
-        if remaining <= 0:
+        if quantity <= 0:
             project.status = "cap_reached"
             self.projects[pid] = project
             return
-        if quantity > remaining:
-            quantity = remaining
 
         # One lot per verification: the lot carries the verified tonnage, so
         # no verified amount is ever truncated into "whole tonnes only".
@@ -849,6 +906,7 @@ class CarbonRegistry(gl.Contract):
             "name": p.name,
             "methodology": p.methodology,
             "unit": p.unit,
+            "source_key": p.source_key,
             "beneficiary": _addr_hex(p.beneficiary),
             "annual_cap_milli": int(p.annual_cap_milli),
             "issued_milli": int(p.issued_milli),
@@ -905,10 +963,30 @@ class CarbonRegistry(gl.Contract):
         }
 
 
-def _run_quantity_consensus(url: str) -> int:
+def _run_quantity_consensus(source_key: str, url: str, remaining: int) -> int:
+    """Consensus over a canonical, project-attributable verified quantity.
+
+    Two properties make this safe:
+
+    1. Attribution (deterministic, not an LLM opinion): the fetched document
+       must literally contain the project's registered source key, checked by
+       an identical substring test on every validator. A stray figure on an
+       unrelated page can never mint credits, and because the check is pure
+       string matching it never itself causes disagreement.
+
+    2. Canonical binding: the extracted reading is rounded to the 0.1-unit
+       grid (so sub-unit extraction noise cancels) and then clamped to the
+       remaining cap. The canonical clamped amount is the exact amount that
+       will be minted, and a validator accepts only when the amount it
+       independently derives equals it. An agreed verification therefore
+       always mints one identical amount — never two within some tolerance.
+    """
+
     def leader_fn():
         body = _fetch_evidence(url)
-        return _extract_quantity(body)
+        _ensure_project_evidence(body, source_key)
+        quantity = _extract_quantity(body)
+        return _clamped_issuance(_canonical_quantity(quantity), remaining)
 
     def validator_fn(leader_result):
         if not isinstance(leader_result, gl.vm.Return):
@@ -917,12 +995,16 @@ def _run_quantity_consensus(url: str) -> int:
         if not isinstance(leader_value, int):
             return False
         try:
-            mine = leader_fn()
+            body = _fetch_evidence(url)
+            _ensure_project_evidence(body, source_key)
+            quantity = _extract_quantity(body)
         except gl.vm.UserError:
             return False
         except Exception:
             return False
-        return _quantities_agree(mine, leader_value)
+        # the issuance is bound to the exact minted amount; two canonical
+        # quantities that mint differently can never be reconciled
+        return _clamped_issuance(_canonical_quantity(quantity), remaining) == leader_value
 
     return gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
 
